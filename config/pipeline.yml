@@ -1,0 +1,176 @@
+# TCFD entity instrument holding metric: SCD2 pipeline
+# class / loader / persistor: short alias (core/registry.py) or dotted path.
+# Every processor takes input_keys: [list]. Filter expressions are SQL.
+# Derived columns use "expr: <SQL>". Variables: {{ VAR }}.
+
+metadata:
+  pipeline_name: tcfd_entity_instrument_holding_metric
+  variables:                      # defaults; override with variables={...}, --var KEY=VALUE or environment variables
+    SCHEMA_STG_INVY: STG_INVY
+    SCHEMA_RAW_INV_WEEKLY: RAW_INV_WEEKLY
+    SCHEMA_CON_INV_WEEKLY: CON_INV_WEEKLY
+  schema_stg: "{{ SCHEMA_STG_INVY }}"
+
+sources:
+  - name: "{{ SCHEMA_RAW_INV_WEEKLY }}.TCFD_INSTRUMENT_LEVEL_RAW"
+    loader: default
+    param:
+      cache_data: true
+      output_df_name: tcfd_instrument_level_raw
+      include_columns:
+        - FILE_AS_OF_DATE
+        - FIL_FMR_ID
+        - FUND_CODE
+        - HOLDING_DATE
+        - PCAF_VALUATION_USD
+        - PCAF_VALUATION_PERCENTAGE
+        - VALUATION_METHOD_MARKET_VALUE_USD_AMOUNT     # needed by the hash steps
+        - VALUATION_METHOD_HEAD_WEIGHTS_PERCENTAGE     # needed by the hash steps
+      filter_expression: "FIL_FMR_ID IS NOT NULL"
+    incremental:
+      enabled: true
+      watermark_column: FILE_AS_OF_DATE
+      watermark_expr: null
+      watermark_table: "{{ SCHEMA_STG_INVY }}.PIPELINE_WATERMARK_STATE"
+      watermark_type: timestamp
+      filter_to_load_time: true
+      source_names: []
+      seed_mode: filter
+      seed_value: "1900-01-01 00:00:00"
+
+  - name: "{{ SCHEMA_CON_INV_WEEKLY }}.TCFD_ENTITY_INSTRUMENT_HOLDING_METRIC"
+    loader: default
+    param:
+      cache_data: true
+      output_df_name: tcfd_entity_instrument_holding_current_df
+      include_columns: [UNIQUE_ACTIVE_BUSINESS_KEY, VALUATION_METHOD_MARKET_VALUE_USD_AMOUNT, VALUATION_METHOD_HEAD_WEIGHTS_PERCENTAGE]
+      filter_expression: "IS_ACTIVE = TRUE"
+
+processors:
+  - id: validate_raw
+    class: validate
+    param:
+      input_keys: [tcfd_instrument_level_raw]
+      on_failure: fail
+      skip_if_empty: true            # incremental slice may be empty: nothing new is not an error
+      rules:
+        required_columns: [FILE_AS_OF_DATE, FIL_FMR_ID, FUND_CODE, HOLDING_DATE,
+                           VALUATION_METHOD_MARKET_VALUE_USD_AMOUNT, VALUATION_METHOD_HEAD_WEIGHTS_PERCENTAGE]
+        not_null: [FIL_FMR_ID, FUND_CODE, HOLDING_DATE]
+        expressions:
+          - name: negative_pcaf_valuation
+            violation: "PCAF_VALUATION_USD < 0"
+            severity: warn
+
+  - id: dedupe_latest                 # step 0
+    class: latest_raw
+    param:
+      input_keys: [tcfd_instrument_level_raw]
+      partition_by: [FIL_FMR_ID, FUND_CODE, HOLDING_DATE]
+      latest_column: [FILE_AS_OF_DATE]
+      order_direction: [desc]
+      is_separate_output_df_required: true
+      output_df_name: tcfd_instrument_level_latest
+
+  - id: project_holding_unit          # step 1
+    class: projection
+    param:
+      input_keys: [tcfd_instrument_level_latest]
+      additional_columns:
+        FIL_FMR_IDENTIFIER: "expr: TRIM(FIL_FMR_ID)"
+        UNIQUE_ACTIVE_BUSINESS_KEY: "expr: CONCAT_WS('|', TRIM(FIL_FMR_ID), FUND_CODE, TO_VARCHAR(HOLDING_DATE))"   # ASSUMPTION
+      exclude_columns: [FILE_AS_OF_DATE, FIL_FMR_ID, FUND_CODE, HOLDING_DATE, PCAF_VALUATION_USD, PCAF_VALUATION_PERCENTAGE]
+      is_separate_output_df_required: true
+      output_df_name: tcfd_entity_instrument_holding_unin
+
+  - id: hash_source                   # step 2
+    class: hash_key
+    param:
+      input_keys: [tcfd_entity_instrument_holding_unin]
+      hash_column: [VALUATION_METHOD_MARKET_VALUE_USD_AMOUNT, VALUATION_METHOD_HEAD_WEIGHTS_PERCENTAGE]
+      hash_key_name: SRC_HASH_KEY
+      is_hash_column_datatype_override_required: true
+      is_separate_output_df_required: true
+      output_df_name: tcfd_entity_src_hash
+
+  - id: hash_target                   # step 3
+    class: hash_key
+    param:
+      input_keys: [tcfd_entity_instrument_holding_current_df]
+      hash_column: [VALUATION_METHOD_MARKET_VALUE_USD_AMOUNT, VALUATION_METHOD_HEAD_WEIGHTS_PERCENTAGE]
+      hash_key_name: TGT_HASH_KEY
+      is_hash_column_datatype_override_required: true
+      is_separate_output_df_required: true
+      output_df_name: tcfd_entity_tgt_hash
+
+  - id: slim_target                   # step 4
+    class: projection
+    param:
+      input_keys: [tcfd_entity_tgt_hash]
+      include_columns: [UNIQUE_ACTIVE_BUSINESS_KEY, TGT_HASH_KEY]
+      is_separate_output_df_required: true
+      output_df_name: tcfd_entity_tgt_slim
+
+  - id: join_src_tgt                  # step 5 (assumed)
+    class: join
+    param:
+      input_keys: [tcfd_entity_src_hash, tcfd_entity_tgt_slim]
+      join_on: {tcfd_entity_tgt_slim: [UNIQUE_ACTIVE_BUSINESS_KEY]}
+      join_types: {tcfd_entity_tgt_slim: left}
+      is_separate_output_df_required: true
+      output_df_name: tcfd_entity_scd2_input
+
+  - id: batch_ids
+    class: batch_id
+    param:
+      input_keys: [tcfd_entity_scd2_input]
+      batch_id_key: BATCH_ID
+      job_id_key: SUB_ID
+      is_separate_output_df_required: true
+      output_df_name: tcfd_entity_scd2_final
+
+  - id: validate_final
+    class: validate
+    param:
+      input_keys: [tcfd_entity_scd2_final]
+      skip_if_empty: true
+      rules:
+        required_columns: [UNIQUE_ACTIVE_BUSINESS_KEY, SRC_HASH_KEY, TGT_HASH_KEY, BATCH_ID, SUB_ID]
+        not_null: [UNIQUE_ACTIVE_BUSINESS_KEY, SRC_HASH_KEY]
+        unique: [UNIQUE_ACTIVE_BUSINESS_KEY]
+
+targets:
+  - name: "{{ SCHEMA_CON_INV_WEEKLY }}.TCFD_ENTITY_INSTRUMENT_HOLDING_METRIC"
+    persistor: scd2
+    param:
+      input_key: tcfd_entity_scd2_final
+      key_columns: [UNIQUE_ACTIVE_BUSINESS_KEY]
+      source_hash_key: SRC_HASH_KEY
+      target_hash_key: TGT_HASH_KEY
+      column_mappings:
+        FIL_FMR_IDENTIFIER: FIL_FMR_IDENTIFIER
+        SUB_ID: SUB_ID
+        BATCH_ID: BATCH_ID
+      effective_from: CREATED_DT
+      effective_to: UPDATED_DT
+      current_flag: IS_ACTIVE
+      updated_date: UPDATED_DT
+      updated_by: UPDATED_BY
+      default_columns:
+        CREATED_DT: "expr: CURRENT_TIMESTAMP"
+        CREATED_BY: "expr: CURRENT_USER"
+        UPDATED_DT: "expr: CURRENT_TIMESTAMP"
+        UPDATED_BY: "expr: CURRENT_USER"
+      persistence_strategy: bulk
+      merge_persistence_strategy: merge_bulk
+      use_transaction: true               # close + soft-delete + insert commit together, or roll back together
+      delete_detection: none              # none | source_flag | full_snapshot
+      # source_flag   : rows with <delete_flag_column> = <delete_flag_value> are soft-deleted (works with incremental)
+      #   delete_flag_column: IS_DELETED  (must survive the projection steps)
+      #   delete_flag_value: true
+      # full_snapshot : active keys missing from the batch are soft-deleted (NOT with incremental sources)
+      #   max_delete_ratio: 0.5           (refuse to close more than 50% of active rows)
+      #   allow_empty_snapshot: false
+      # deleted_flag_column: IS_DELETED   (optional: also set TRUE on rows closed by a delete)
+      incremental:
+        enabled: true
